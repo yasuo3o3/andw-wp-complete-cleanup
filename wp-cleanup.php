@@ -12,6 +12,10 @@ if (PHP_VERSION_ID < 70400) {
 /**
  * WordPress Complete Cleanup Script
  *
+ * 【重要: 免責事項と自己責任での利用】
+ * このプログラムを盲信せず、実行前に必ずご自身でコードの内容を確認するか、AI等にチェックさせてください。
+ * 本スクリプトの利用は完全な自己責任となります。実行によるデータの消失や不具合について制作者は責任を負いません。
+ *
  * FTPでWordPressルートに設置し、ブラウザからアクセスして使用。
  * 対象プレフィックスのDBテーブルとWP関連ファイルを安全に削除する。
  *
@@ -305,7 +309,7 @@ function parseDbHost(string $host): array
             $rest = substr($host, $closeBracket + 1);
             $host = $ipv6Host;
             if (strpos($rest, ':') === 0 && strlen($rest) > 1) {
-                $port = (int)substr($rest, 1);
+                $port = (int) substr($rest, 1);
             }
         }
         return ['host' => $host, 'port' => $port, 'socket' => $socket];
@@ -315,7 +319,7 @@ function parseDbHost(string $host): array
     if (strpos($host, ':') !== false && substr_count($host, ':') === 1) {
         list($host, $portStr) = explode(':', $host, 2);
         if (is_numeric($portStr)) {
-            $port = (int)$portStr;
+            $port = (int) $portStr;
         }
     }
     // コロンが複数 = ブラケットなしIPv6（例: ::1）→ そのまま使用
@@ -382,7 +386,7 @@ function getTableRowCounts(mysqli $conn, array $tables): array
         try {
             $result = $conn->query("SELECT COUNT(*) FROM {$quoted}");
             $row = $result->fetch_row();
-            $counts[$table] = (int)$row[0];
+            $counts[$table] = (int) $row[0];
         } catch (Exception $e) {
             $counts[$table] = '取得不可';
         }
@@ -402,8 +406,19 @@ function getAllPrefixes(mysqli $conn, string $dbName): array
     }
 
     // WordPressのコアテーブル名パターンからプレフィックスを推定
-    $wpCoreTables = ['posts', 'postmeta', 'options', 'users', 'usermeta', 'terms',
-                     'term_taxonomy', 'term_relationships', 'comments', 'commentmeta', 'links'];
+    $wpCoreTables = [
+        'posts',
+        'postmeta',
+        'options',
+        'users',
+        'usermeta',
+        'terms',
+        'term_taxonomy',
+        'term_relationships',
+        'comments',
+        'commentmeta',
+        'links'
+    ];
     $prefixes = [];
     foreach ($tables as $table) {
         foreach ($wpCoreTables as $core) {
@@ -532,11 +547,13 @@ function deleteWpFiles(string $rootDir, string $selfPath = ''): array
     $items = @scandir($rootDir);
     if ($items) {
         foreach ($items as $item) {
-            if ($item === '.' || $item === '..') continue;
+            if ($item === '.' || $item === '..')
+                continue;
             $itemPath = $rootDir . DIRECTORY_SEPARATOR . $item;
             if (!is_dir($itemPath) && preg_match(WP_FILE_PATTERN, $item)) {
                 $realItem = realpath($itemPath);
-                if ($selfPath !== '' && $realItem !== false && $realItem === $selfPath) continue;
+                if ($selfPath !== '' && $realItem !== false && $realItem === $selfPath)
+                    continue;
                 if (@unlink($itemPath)) {
                     $results['deleted_files'][] = $item;
                 } else {
@@ -550,9 +567,11 @@ function deleteWpFiles(string $rootDir, string $selfPath = ''): array
     $items = @scandir($rootDir);
     if ($items) {
         foreach ($items as $item) {
-            if ($item === '.' || $item === '..') continue;
+            if ($item === '.' || $item === '..')
+                continue;
             $realItem = realpath($rootDir . DIRECTORY_SEPARATOR . $item);
-            if ($selfPath !== '' && $realItem !== false && $realItem === $selfPath) continue;
+            if ($selfPath !== '' && $realItem !== false && $realItem === $selfPath)
+                continue;
             $results['skipped'][] = $item;
         }
     }
@@ -583,7 +602,8 @@ function deleteDirectoryRecursive(string $dir, string $excludePath, int &$count)
 
             // 自分自身は除外
             $realItemPath = realpath($path);
-            if ($excludePath !== '' && $realItemPath !== false && $realItemPath === $excludePath) continue;
+            if ($excludePath !== '' && $realItemPath !== false && $realItemPath === $excludePath)
+                continue;
 
             // 1000ファイルごとにタイムアウトリセット
             if (++$count % 1000 === 0) {
@@ -772,6 +792,13 @@ if ($action === 'login') {
     }
 
     renderPage('WordPress Cleanup - 認証', '
+        <div class="card warning" style="border-color: #ff4757;">
+            <h2 style="margin-top:0; color: #ff4757;">⚠️ 重要: 免責事項と自己責任での利用</h2>
+            <p style="font-size: 0.9rem; line-height: 1.5; margin-bottom: 0;">
+                このプログラムを盲信せず、実行前に必ずご自身でコードの内容を確認するか、AI等にチェックさせて安全性を確認してください。<br>
+                本スクリプトの利用は<strong>完全な自己責任</strong>となります。実行によって発生したデータの消失（意図しない削除を含む）やシステムの不具合について、制作者はいかなる責任も負いません。
+            </p>
+        </div>
         ' . $errorHtml . '
         <div class="card">
             <form method="post">
@@ -921,7 +948,7 @@ if ($action === 'confirm') {
         } else {
             $body .= '<table><tr><th>テーブル名</th><th>行数</th></tr>';
             foreach ($rowCounts as $tbl => $cnt) {
-                $body .= '<tr><td class="mono">' . h($tbl) . '</td><td>' . h((string)$cnt) . '</td></tr>';
+                $body .= '<tr><td class="mono">' . h($tbl) . '</td><td>' . h((string) $cnt) . '</td></tr>';
             }
             $body .= '</table>';
         }
