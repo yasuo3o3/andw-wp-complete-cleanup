@@ -434,6 +434,55 @@ function getAllPrefixes(mysqli $conn, string $dbName): array
 }
 
 // ============================================================
+// マルチサイトのサブサイト表記のプレフィックス判定
+// 例: 対象が wp_ のとき wp_2_ / wp_3_ は同一インストールのサブサイト
+// ============================================================
+function isMultisiteSubsitePrefix(string $prefix, string $targetPrefix): bool
+{
+    return (bool) preg_match('/^' . preg_quote($targetPrefix, '/') . '\d+_$/', $prefix);
+}
+
+// ============================================================
+// 別インストールに属するテーブルを削除対象から分離
+//
+// LIKE 'prefix%' は「対象プレフィックスで始まる別インストール」(例: wp_ に対する wp_old_)の
+// テーブルも拾ってしまう。検出済みプレフィックスと突き合わせ、別インストールと判断したものを
+// 削除対象から除外して保護する。マルチサイトのサブサイト(wp_2_ 等)は対象の一部なので残す。
+// 安全側に倒すため、判断に迷うものは「保護」に寄せる。
+// ============================================================
+function separateForeignTables(array $tables, string $targetPrefix, array $allPrefixes): array
+{
+    // 別インストールとみなすプレフィックス
+    $foreignPrefixes = [];
+    foreach ($allPrefixes as $p) {
+        if ($p !== $targetPrefix
+            && strpos($p, $targetPrefix) === 0
+            && !isMultisiteSubsitePrefix($p, $targetPrefix)) {
+            $foreignPrefixes[] = $p;
+        }
+    }
+
+    $own = [];
+    $foreign = [];
+    foreach ($tables as $t) {
+        $isForeign = false;
+        foreach ($foreignPrefixes as $fp) {
+            if (strpos($t, $fp) === 0) {
+                $isForeign = true;
+                break;
+            }
+        }
+        if ($isForeign) {
+            $foreign[] = $t;
+        } else {
+            $own[] = $t;
+        }
+    }
+
+    return ['own' => $own, 'foreign' => $foreign, 'foreignPrefixes' => $foreignPrefixes];
+}
+
+// ============================================================
 // 入れ子WordPress検出
 // ============================================================
 function detectNestedWP(string $rootDir): array
@@ -453,6 +502,51 @@ function detectNestedWP(string $rootDir): array
         // アクセスできないディレクトリはスキップ
     }
     return $nested;
+}
+
+// ============================================================
+// 入れ子WordPressを「削除される／保護される」に分類
+// 実際に削除されるのはホワイトリストディレクトリ(wp-content等)配下のみ。
+// それ以外の場所にある入れ子WPは削除されない=保護される。
+// ============================================================
+function classifyNestedWP(array $nestedPaths, string $rootDir): array
+{
+    $realRoot = realpath($rootDir);
+    $willDelete = [];
+    $protected = [];
+
+    foreach ($nestedPaths as $path) {
+        $realPath = realpath($path);
+        $underWhitelist = false;
+
+        if ($realRoot !== false && $realPath !== false && strpos($realPath, $realRoot) === 0) {
+            $rel = ltrim(substr($realPath, strlen($realRoot)), '/\\');
+            $rel = str_replace('\\', '/', $rel);
+            $firstSeg = explode('/', $rel)[0];
+            if (in_array($firstSeg, WP_KNOWN_DIRS, true)) {
+                $underWhitelist = true;
+            }
+        }
+
+        if ($underWhitelist) {
+            $willDelete[] = $path;
+        } else {
+            $protected[] = $path;
+        }
+    }
+
+    return ['willDelete' => $willDelete, 'protected' => $protected];
+}
+
+// ============================================================
+// ドキュメントルート直下では .htaccess 等(WP以外のルールを含む可能性)を保護
+// ============================================================
+function wpKnownFilesFor(bool $isDocRoot): array
+{
+    if ($isDocRoot) {
+        return array_values(array_diff(WP_KNOWN_FILES, ['.htaccess', '.htpasswd', '.user.ini']));
+    }
+    return WP_KNOWN_FILES;
 }
 
 // ============================================================
@@ -509,10 +603,13 @@ function dropTables(mysqli $conn, array $tables): array
 // ============================================================
 // ホワイトリスト方式のファイル削除
 // ============================================================
-function deleteWpFiles(string $rootDir, string $selfPath = ''): array
+function deleteWpFiles(string $rootDir, string $selfPath = '', ?array $knownFiles = null): array
 {
     $results = ['deleted_dirs' => [], 'deleted_files' => [], 'errors' => [], 'skipped' => []];
     $count = 0;
+    if ($knownFiles === null) {
+        $knownFiles = WP_KNOWN_FILES;
+    }
 
     // 1. ホワイトリストのディレクトリを再帰削除
     foreach (WP_KNOWN_DIRS as $dir) {
@@ -528,7 +625,7 @@ function deleteWpFiles(string $rootDir, string $selfPath = ''): array
     }
 
     // 2. ホワイトリストのファイルを削除
-    foreach (WP_KNOWN_FILES as $file) {
+    foreach ($knownFiles as $file) {
         $filePath = $rootDir . DIRECTORY_SEPARATOR . $file;
         if (file_exists($filePath) && !is_dir($filePath)) {
             $realFile = realpath($filePath);
@@ -789,6 +886,10 @@ if ($action === 'login') {
     $expiryInfo = '';
     if (EXPIRES_AT > 0) {
         $expiryInfo = '<p style="margin-top:0.8rem;color:#a0a0c0;font-size:0.85rem;">有効期限: ' . date('Y-m-d H:i:s', EXPIRES_AT) . '</p>';
+    } else {
+        $expiryInfo = '<p style="margin-top:0.8rem;color:#ffa502;font-size:0.85rem;">'
+            . '⚠️ 有効期限が「無制限」に設定されています。放置すると第三者にアクセスされる恐れがあります。'
+            . '<span class="mono">EXPIRES_AT</span> の設定、または作業後の速やかな削除を強く推奨します。</p>';
     }
 
     renderPage('WordPress Cleanup - 認証', '
@@ -832,13 +933,21 @@ if ($action === 'confirm') {
         $config = parseWpConfig($configPath);
         $conn = connectDatabase($config);
 
-        // 対象テーブル取得
-        $tables = getTargetTables($conn, $config['DB_NAME'], $config['table_prefix']);
+        // DB内の全プレフィックス検出
+        $allPrefixes = getAllPrefixes($conn, $config['DB_NAME']);
+
+        // 対象テーブル取得 → 別インストール分を分離して保護
+        $matchedTables = getTargetTables($conn, $config['DB_NAME'], $config['table_prefix']);
+        $sep = separateForeignTables($matchedTables, $config['table_prefix'], $allPrefixes);
+        $tables = $sep['own'];          // 実際に削除するテーブル
+        $foreignTables = $sep['foreign']; // 保護したテーブル（別インストールの可能性）
         $rowCounts = getTableRowCounts($conn, $tables);
 
-        // DB内の他プレフィックス検出
-        $allPrefixes = getAllPrefixes($conn, $config['DB_NAME']);
-        $otherPrefixes = array_filter($allPrefixes, fn($p) => $p !== $config['table_prefix']);
+        // 削除されない他プレフィックス（マルチサイトのサブサイトは対象なので除外）
+        $otherPrefixes = array_values(array_filter(
+            $allPrefixes,
+            fn($p) => $p !== $config['table_prefix'] && !isMultisiteSubsitePrefix($p, $config['table_prefix'])
+        ));
 
         // DROP権限チェック
         $hasDropPrivilege = checkDropPrivilege($conn);
@@ -871,11 +980,11 @@ if ($action === 'confirm') {
         // CSRFトークン生成
         $csrf = generateCsrfToken();
 
-        // セッションにDB情報を保存（実行時に使う）
-        $_SESSION['wp_cleanup_config'] = $config;
+        // セッションに実行用情報を保存（DB認証情報は保存せず、実行時に再解析する）
         $_SESSION['wp_cleanup_tables'] = $tables;
         $_SESSION['wp_cleanup_confirm_domain'] = $confirmDomain;
         $_SESSION['wp_cleanup_config_path'] = $configPath;
+        $_SESSION['wp_cleanup_is_docroot'] = $isDocRoot;
 
         // --- HTML組み立て ---
         // h() グローバル関数を使用
@@ -913,13 +1022,29 @@ if ($action === 'confirm') {
         }
 
         if (!empty($nestedWP)) {
-            $body .= '<div class="card warning">';
-            $body .= '<h2>注意: サブディレクトリにWordPressが存在</h2>';
-            $body .= '<p>以下のディレクトリにも別のWordPressがインストールされています。これらも削除対象に含まれます。</p><ul>';
-            foreach ($nestedWP as $nwp) {
-                $body .= '<li class="mono">' . h($nwp) . '</li>';
+            $nestedClass = classifyNestedWP($nestedWP, WP_ROOT);
+
+            // wp-content 等の配下にある入れ子WP → 実際に削除される
+            if (!empty($nestedClass['willDelete'])) {
+                $body .= '<div class="card warning">';
+                $body .= '<h2>注意: 削除対象ディレクトリ内に別のWordPress</h2>';
+                $body .= '<p>以下のディレクトリはwp-content等の削除対象配下にあるため、<strong>まとめて削除されます</strong>。</p><ul>';
+                foreach ($nestedClass['willDelete'] as $nwp) {
+                    $body .= '<li class="mono">' . h($nwp) . '</li>';
+                }
+                $body .= '</ul></div>';
             }
-            $body .= '</ul></div>';
+
+            // ホワイトリスト外の入れ子WP → 削除されない（保護される）
+            if (!empty($nestedClass['protected'])) {
+                $body .= '<div class="card info">';
+                $body .= '<h2>参考: サブディレクトリの別WordPress（保護）</h2>';
+                $body .= '<p>以下のディレクトリにも別のWordPressがありますが、削除対象ディレクトリの外にあるため<strong>削除されません</strong>。</p><ul>';
+                foreach ($nestedClass['protected'] as $nwp) {
+                    $body .= '<li class="mono">' . h($nwp) . '</li>';
+                }
+                $body .= '</ul></div>';
+            }
         }
 
         if (!$hasDropPrivilege) {
@@ -938,6 +1063,20 @@ if ($action === 'confirm') {
                 $body .= '<span class="tag tag-green">' . h($op) . '</span> ';
             }
             $body .= '</p></div>';
+        }
+
+        // 別インストールと判断して保護したテーブル
+        if (!empty($foreignTables)) {
+            $body .= '<div class="card warning">';
+            $body .= '<h2>保護したテーブル（削除しません）</h2>';
+            $foreignPrefixTags = implode(', ', array_map(fn($p) => '<span class="mono">' . h($p) . '</span>', $sep['foreignPrefixes']));
+            $body .= '<p>プレフィックス <span class="mono">' . h($config['table_prefix']) . '</span> で始まりますが、'
+                . '別インストール（' . $foreignPrefixTags . '）'
+                . 'に属すると判断したため、<strong>削除対象から除外</strong>しました:</p><ul>';
+            foreach ($foreignTables as $ft) {
+                $body .= '<li class="mono">' . h($ft) . '</li>';
+            }
+            $body .= '</ul><p>もしこれらが本サイトのテーブルであれば、phpMyAdmin等から手動で削除してください。</p></div>';
         }
 
         // 対象テーブル一覧
@@ -964,7 +1103,8 @@ if ($action === 'confirm') {
                 $body .= '<li><span class="tag tag-red">DIR</span> <span class="mono">' . h($d) . '/</span></li>';
             }
         }
-        foreach (WP_KNOWN_FILES as $f) {
+        $knownFiles = wpKnownFilesFor($isDocRoot);
+        foreach ($knownFiles as $f) {
             $path = WP_ROOT . DIRECTORY_SEPARATOR . $f;
             if (file_exists($path)) {
                 $body .= '<li><span class="tag tag-yellow">FILE</span> <span class="mono">' . h($f) . '</span></li>';
@@ -974,12 +1114,19 @@ if ($action === 'confirm') {
         $items = @scandir(WP_ROOT);
         if ($items) {
             foreach ($items as $item) {
-                if (preg_match(WP_FILE_PATTERN, $item) && !in_array($item, WP_KNOWN_FILES)) {
+                if (preg_match(WP_FILE_PATTERN, $item) && !in_array($item, $knownFiles)) {
                     $body .= '<li><span class="tag tag-yellow">FILE</span> <span class="mono">' . h($item) . '</span></li>';
                 }
             }
         }
-        $body .= '</ul></div>';
+        $body .= '</ul>';
+        if ($isDocRoot) {
+            $body .= '<p style="color:#a0a0c0;font-size:0.85rem;margin-top:0.5rem;">'
+                . 'ドキュメントルート直下のため <span class="mono">.htaccess</span> / '
+                . '<span class="mono">.htpasswd</span> / <span class="mono">.user.ini</span> は'
+                . 'WordPress以外の設定を含む可能性があるため削除しません。</p>';
+        }
+        $body .= '</div>';
 
         // 最終確認フォーム
         $body .= '<div class="card warning">';
@@ -1016,14 +1163,23 @@ if ($action === 'execute') {
         exit;
     }
 
-    // セッションからDB情報を取得
-    $config = $_SESSION['wp_cleanup_config'] ?? null;
+    // セッションから実行用情報を取得
     $tables = $_SESSION['wp_cleanup_tables'] ?? null;
     $expectedDomain = $_SESSION['wp_cleanup_confirm_domain'] ?? null;
     $storedConfigPath = $_SESSION['wp_cleanup_config_path'] ?? null;
-    if (!$config || !$tables || !$expectedDomain) {
+    $isDocRoot = !empty($_SESSION['wp_cleanup_is_docroot']);
+    if ($tables === null || !$expectedDomain || !$storedConfigPath) {
         renderPage('エラー', '<div class="card warning"><p>セッションが切れました。<a href="' . h($_SERVER['SCRIPT_NAME']) . '" style="color:#4ecdc4;">最初からやり直す</a></p></div>');
         exit;
+    }
+
+    // DB認証情報はセッションに保存していないため、実行時に wp-config.php を再解析する
+    $config = null;
+    $configParseError = '';
+    try {
+        $config = parseWpConfig($storedConfigPath);
+    } catch (Exception $e) {
+        $configParseError = $e->getMessage();
     }
 
     // ドメイン名一致チェック（セッションに保存されたDB由来のドメインと比較）
@@ -1051,12 +1207,16 @@ if ($action === 'execute') {
     // 1. DBテーブル削除（最初に実行。失敗してもリトライ可能）
     $skipDb = ($_POST['skip_db'] ?? '0') === '1';
     if (!$skipDb && !empty($tables)) {
-        try {
-            $conn = connectDatabase($config);
-            $dbErrors = dropTables($conn, $tables);
-            $conn->close();
-        } catch (Exception $e) {
-            $dbErrors[] = 'DB接続エラー: ' . $e->getMessage();
+        if ($config === null) {
+            $dbErrors[] = 'wp-config.php の再解析に失敗しました: ' . $configParseError;
+        } else {
+            try {
+                $conn = connectDatabase($config);
+                $dbErrors = dropTables($conn, $tables);
+                $conn->close();
+            } catch (Exception $e) {
+                $dbErrors[] = 'DB接続エラー: ' . $e->getMessage();
+            }
         }
     }
 
@@ -1074,8 +1234,8 @@ if ($action === 'execute') {
         }
     }
 
-    // 3. ファイル削除（自己パスを渡して除外判定に使う）
-    $fileResults = deleteWpFiles(WP_ROOT, $selfRealPath);
+    // 3. ファイル削除（自己パスを渡して除外判定に使う。ドキュメントルート直下では .htaccess 等を保護）
+    $fileResults = deleteWpFiles(WP_ROOT, $selfRealPath, wpKnownFilesFor($isDocRoot));
 
     // 4. スクリプト自身を最後に削除（メモリ上で実行継続）
     $selfDeleted = @unlink($selfRealPath);
